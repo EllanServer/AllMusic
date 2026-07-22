@@ -35,6 +35,7 @@ public abstract class TextFrameBuffer<T> {
     public void use() {
         isDraw = true;
         texts.clear();
+        offsetX = 0;
     }
 
     public void clear() {

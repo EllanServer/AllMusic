@@ -21,6 +21,9 @@
     "client": [
       "com.coloryr.allmusic.client.AllMusicClient"
     ],
+    "sodium:config_api_user": [
+      "com.coloryr.allmusic.client.AllMusicSodiumConfig"
+    ],
     "voicechat": [
       "com.coloryr.allmusic.client.others.VoiceChat"
     ]
@@ -37,7 +40,7 @@
     "fabric-api": "*"
   },
   "suggests": {
-    "modernui": "*",
+    "sodium": ">=0.9.1",
     "voicechat_api": "*"
   }
 }
