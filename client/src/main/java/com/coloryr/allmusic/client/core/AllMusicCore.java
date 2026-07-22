@@ -42,6 +42,7 @@ public class AllMusicCore {
      * 配置文件
      */
     public static ConfigObj config;
+    private static File configFile;
     public static CloseableHttpClient client;
     /**
      * 音频解码器与播放器
@@ -87,7 +88,7 @@ public class AllMusicCore {
         headers.add(new BasicHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0"));
         client = HttpClients.custom().setDefaultHeaders(headers).build();
 
-        File configFile = new File(file.toFile(), "allmusic_client.json");
+        configFile = new File(file.toFile(), "allmusic_client.json");
         if (configFile.exists()) {
             try {
                 InputStreamReader reader = new InputStreamReader(
@@ -105,19 +106,9 @@ public class AllMusicCore {
             config = new ConfigObj();
             config.picSize = 120;
             config.queueSize = 100;
-            try {
-                String data = new GsonBuilder().setPrettyPrinting()
-                        .create()
-                        .toJson(config);
-                FileOutputStream out = new FileOutputStream(configFile);
-                OutputStreamWriter write = new OutputStreamWriter(out, StandardCharsets.UTF_8);
-                write.write(data);
-                write.close();
-                out.close();
-            } catch (Exception e) {
-                e.printStackTrace();
-            }
         }
+        config.validate();
+        saveConfig();
 
         AllMusicCore.bridge = bridge;
         player = new AllMusicPlayer(source);
@@ -132,6 +123,22 @@ public class AllMusicCore {
         coreConfig.setLevel(Level.INFO);
 
         ctx.updateLoggers(config);
+    }
+
+    /** Persist client-only presentation settings changed from the config UI. */
+    public static synchronized void saveConfig() {
+        if (config == null || configFile == null) {
+            return;
+        }
+
+        config.validate();
+        try (FileOutputStream out = new FileOutputStream(configFile);
+             OutputStreamWriter writer = new OutputStreamWriter(out, StandardCharsets.UTF_8)) {
+            String data = new GsonBuilder().setPrettyPrinting().create().toJson(config);
+            writer.write(data);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
     }
 
     public static void stop() {
@@ -193,6 +200,7 @@ public class AllMusicCore {
      * 更新显示内容
      */
     public static void hudUpdate() {
+        hud.syncPlayback(player != null && player.isPlay());
         hud.update();
     }
 

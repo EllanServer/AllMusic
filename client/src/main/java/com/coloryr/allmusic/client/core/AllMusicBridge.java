@@ -3,6 +3,7 @@ package com.coloryr.allmusic.client.core;
 import com.coloryr.allmusic.client.core.render.PictureFrameBuffer;
 import com.coloryr.allmusic.client.core.render.TextFrameBuffer;
 import com.coloryr.allmusic.client.core.render.TextureRender;
+import com.coloryr.allmusic.client.core.render.ModernHudRender;
 
 import java.io.InputStream;
 
@@ -79,6 +80,14 @@ public interface AllMusicBridge {
      * @return 图片渲染
      */
     PictureFrameBuffer makePictureRender(int size);
+
+    /**
+     * Creates the optional modern HUD renderer. Returning {@code null} keeps the
+     * legacy renderer on Minecraft versions that do not implement it.
+     */
+    default ModernHudRender makeModernHudRender(int size) {
+        return null;
+    }
 
     /**
      * 读取文件

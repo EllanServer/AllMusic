@@ -38,7 +38,7 @@ public class AllMusicPlayer extends InputStream {
     private boolean isClose = false;
     private boolean reload = false;
     private IDecoder decoder;
-    private boolean isPlay = false;
+    private volatile boolean isPlay = false;
     private boolean wait = false;
     private int index = -1;
     private IntBuffer source;

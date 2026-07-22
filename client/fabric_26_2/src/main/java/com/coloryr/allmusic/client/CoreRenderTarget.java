@@ -9,20 +9,25 @@ import net.minecraft.client.gui.Font;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 import net.minecraft.network.chat.Component;
 
-import java.util.ArrayList;
-import java.util.List;
+import java.util.regex.Pattern;
 
 public class CoreRenderTarget extends TextFrameBuffer<Component> {
+    private static final Pattern LEGACY_FORMATTING = Pattern.compile("(?i)§[0-9A-FK-ORX]");
     private final boolean isState;
+    private final boolean forcePlainColor;
 
     public CoreRenderTarget(String name) {
         isState = name.equals("state");
+        forcePlainColor = name.startsWith("modern lyric");
     }
 
     @Override
     public void putText(String text, int y, int color, boolean shadow) {
         color = (color & 0x00FFFFFF) | 0xFF000000;
-        Component component = MiniMessage.parse(text);
+        Component parsed = MiniMessage.parse(text);
+        Component component = forcePlainColor
+                ? Component.literal(LEGACY_FORMATTING.matcher(parsed.getString()).replaceAll(""))
+                : parsed;
         Font font = Minecraft.getInstance().font;
         int width = font.width(component);
         if (width == 0) {
@@ -102,18 +107,26 @@ public class CoreRenderTarget extends TextFrameBuffer<Component> {
             int finalColor = applyAlpha(entry.color, alpha);
 
             if (maxWidth != -1 && entry.width > maxWidth) {
-                float maxOffset = entry.width - maxWidth;
-                float texOffset = maxOffset * state;
-                int revealWidth = (int) (maxWidth * state);
+                int scrollOffset = (int) getOffset(entry, maxWidth);
+                float revealPosition = entry.width * clamp01(state);
+                int revealWidth = Math.max(0, Math.min(maxWidth,
+                        Math.round(revealPosition - scrollOffset)));
 
-                gui.enableScissor(drawX, Math.max(0, drawY), drawX + revealWidth, drawY + entry.height);
-                gui.text(font, entry.component, drawX - (int) texOffset, drawY, finalColor, entry.shadow);
-                gui.disableScissor();
+                if (revealWidth > 0) {
+                    gui.enableScissor(drawX, Math.max(0, drawY),
+                            drawX + revealWidth, drawY + entry.height);
+                    gui.text(font, entry.component, drawX - scrollOffset,
+                            drawY, finalColor, entry.shadow);
+                    gui.disableScissor();
+                }
             } else {
-                int revealWidth = (int) (entry.width * state);
-                gui.enableScissor(drawX, Math.max(0, drawY), drawX + revealWidth, drawY + entry.height);
-                gui.text(font, entry.component, drawX, drawY, finalColor, entry.shadow);
-                gui.disableScissor();
+                int revealWidth = Math.round(entry.width * clamp01(state));
+                if (revealWidth > 0) {
+                    gui.enableScissor(drawX, Math.max(0, drawY),
+                            drawX + revealWidth, drawY + entry.height);
+                    gui.text(font, entry.component, drawX, drawY, finalColor, entry.shadow);
+                    gui.disableScissor();
+                }
             }
         }
     }
@@ -132,5 +145,9 @@ public class CoreRenderTarget extends TextFrameBuffer<Component> {
         if (a < 0) a = 0;
         if (a > 255) a = 255;
         return (color & 0x00FFFFFF) | (a << 24);
+    }
+
+    private static float clamp01(float value) {
+        return Math.max(0.0f, Math.min(1.0f, value));
     }
 }

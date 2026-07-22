@@ -1,0 +1,16 @@
+AllMusic Client CustomNameplates-style ActionBar background
+===========================================================
+
+The compact lyric background is adapted from CustomNameplates' GPL-3.0
+`bedrock_2` background assets and adaptive-width layout:
+
+Custom-Nameplates
+https://github.com/Xiao-MoMi/Custom-Nameplates
+Copyright (C) 2022-2024 XiaoMoMi
+
+Both CustomNameplates and AllMusic are distributed under GNU GPL version 3.
+The complete license is included with the AllMusic source distribution.
+
+AllMusic's adaptation generates the equivalent three-slice bitmap at runtime:
+14 pixels high, black at alpha 112/255, with one transparent corner pixel.
+It does not include or require CustomNameplates' optional text shaders.

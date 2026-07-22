@@ -3,6 +3,7 @@ package com.coloryr.allmusic.client;
 import com.coloryr.allmusic.client.core.AllMusicBridge;
 import com.coloryr.allmusic.client.core.AllMusicCore;
 import com.coloryr.allmusic.client.core.render.PictureFrameBuffer;
+import com.coloryr.allmusic.client.core.render.ModernHudRender;
 import com.coloryr.allmusic.client.core.render.TextFrameBuffer;
 import com.coloryr.allmusic.client.core.render.TextureRender;
 import com.coloryr.allmusic.comm.MusicCodec;
@@ -19,11 +20,11 @@ import net.minecraft.client.renderer.texture.AbstractTexture;
 import net.minecraft.network.Connection;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.Identifier;
-import net.minecraft.server.packs.resources.Resource;
 import net.minecraft.sounds.SoundSource;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import java.io.FileNotFoundException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 
@@ -90,16 +91,17 @@ public class AllMusicClient implements ClientModInitializer, AllMusicBridge {
     }
 
     @Override
+    public ModernHudRender makeModernHudRender(int size) {
+        return new ModernHudRenderer26(size);
+    }
+
+    @Override
     public String readText(String file) {
-        try {
-            var man = Minecraft.getInstance().getResourceManager();
-            Resource resource = man.getResource(Identifier.fromNamespaceAndPath(MODID, file)).orElseThrow();
-            try (InputStream inputStream = resource.open()) {
-                byte[] bytes = inputStream.readAllBytes();
-                return new String(bytes, StandardCharsets.UTF_8);
-            }
+        try (InputStream inputStream = openBuiltInResource(file)) {
+            byte[] bytes = inputStream.readAllBytes();
+            return new String(bytes, StandardCharsets.UTF_8);
         } catch (Exception e) {
-            e.printStackTrace();
+            LOGGER.warn("Could not read built-in text resource {}", file, e);
             return null;
         }
     }
@@ -107,13 +109,26 @@ public class AllMusicClient implements ClientModInitializer, AllMusicBridge {
     @Override
     public InputStream readFile(String file) {
         try {
-            var man = Minecraft.getInstance().getResourceManager();
-            Resource resource = man.getResource(Identifier.fromNamespaceAndPath(MODID, file)).orElseThrow();
-            return resource.open();
+            return openBuiltInResource(file);
         } catch (Exception e) {
-            e.printStackTrace();
+            LOGGER.warn("Could not read built-in resource {}", file, e);
             return null;
         }
+    }
+
+    static InputStream openBuiltInResource(String file) throws Exception {
+        var manager = Minecraft.getInstance().getResourceManager();
+        var resource = manager.getResource(Identifier.fromNamespaceAndPath(MODID, file));
+        if (resource.isPresent()) {
+            return resource.get().open();
+        }
+
+        String classpath = "assets/" + MODID + "/" + file;
+        InputStream stream = AllMusicClient.class.getClassLoader().getResourceAsStream(classpath);
+        if (stream == null) {
+            throw new FileNotFoundException(classpath);
+        }
+        return stream;
     }
 
     @Override
@@ -133,6 +148,7 @@ public class AllMusicClient implements ClientModInitializer, AllMusicBridge {
 
         AllMusicCore.init(FabricLoader.getInstance().getConfigDir(), this);
 
+        ClientLifecycleEvents.CLIENT_STARTED.register((a) -> AllMusicCore.renderInit());
         ClientLifecycleEvents.CLIENT_STOPPING.register((a) -> AllMusicCore.stop());
     }
 }

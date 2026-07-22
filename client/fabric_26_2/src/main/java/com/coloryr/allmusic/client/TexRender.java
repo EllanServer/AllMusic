@@ -6,13 +6,14 @@ import com.coloryr.allmusic.client.core.render.TextureRender;
 import com.coloryr.allmusic.codec.HudPosType;
 import com.mojang.blaze3d.systems.RenderSystem;
 import com.mojang.blaze3d.textures.FilterMode;
-import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.render.TextureSetup;
 import net.minecraft.client.renderer.RenderPipelines;
 import net.minecraft.client.renderer.texture.SimpleTexture;
 import net.minecraft.client.renderer.texture.TextureContents;
 import net.minecraft.resources.Identifier;
 import org.joml.Matrix3x2f;
+
+import java.io.InputStream;
 
 public class TexRender extends TextureRender {
     private final SimpleTexture sourceTexture;
@@ -22,8 +23,9 @@ public class TexRender extends TextureRender {
         Identifier location = Identifier.fromNamespaceAndPath(AllMusicClient.MODID, texture);
         sourceTexture = new SimpleTexture(location);
 
-        try {
-            TextureContents contents = sourceTexture.loadContents(Minecraft.getInstance().getResourceManager());
+        try (InputStream stream = AllMusicClient.openBuiltInResource(texture)) {
+            TextureContents contents = new TextureContents(
+                    com.mojang.blaze3d.platform.NativeImage.read(stream), null);
 
             width = contents.image().getWidth();
             height = contents.image().getHeight();
