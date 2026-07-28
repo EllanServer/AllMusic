@@ -5,7 +5,9 @@
   "client": [
     "GuiShow",
     "QuitServer",
+    "SoundEngineAccessor",
     "SoundEvent",
+    "SoundManagerAccessor",
     "Tick"
   ],
   "injectors": {

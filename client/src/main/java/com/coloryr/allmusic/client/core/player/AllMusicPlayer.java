@@ -30,6 +30,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -58,7 +59,7 @@ public class AllMusicPlayer extends InputStream implements SeekableInput {
     private long local;
     private volatile long contentLength = -1;
     private boolean isRun;
-    private boolean isChat;
+    private volatile boolean isChat;
     private ScheduledExecutorService scheduler;
 
     public AllMusicPlayer(IntBuffer source) {
@@ -238,22 +239,142 @@ public class AllMusicPlayer extends InputStream implements SeekableInput {
 
     private void resetSource() {
         if (index != -1) {
+            runOnSoundThread(() -> {
+                AL10.alSourceStop(index);
+                AL10.alSourcei(index, AL10.AL_BUFFER, AL10.AL_NONE);
+
+                int queued;
+                do {
+                    queued = AL10.alGetSourcei(index, AL10.AL_BUFFERS_QUEUED);
+                    if (queued > 0) {
+                        int buffer = AL10.alSourceUnqueueBuffers(index);
+                        if (buffer != 0) {
+                            AL10.alDeleteBuffers(buffer);
+                        }
+                    }
+                } while (queued > 0);
+
+                AL10.alSourcef(index, AL10.AL_GAIN, AllMusicCore.bridge.getVolume());
+                AL10.alSourcef(index, AL10.AL_PITCH, 1.0f);
+            });
+        }
+    }
+
+    private <T> T onSoundThread(Supplier<T> action) {
+        return AllMusicCore.bridge.callOnSoundThread(action);
+    }
+
+    private void runOnSoundThread(Runnable action) {
+        onSoundThread(() -> {
+            action.run();
+            return null;
+        });
+    }
+
+    private int queuedBuffers() {
+        return onSoundThread(() -> AL10.alGetSourcei(index, AL10.AL_BUFFERS_QUEUED));
+    }
+
+    private void queueBuffer(BuffPack output, int channels, int frequency) {
+        ByteBuffer byteBuffer = BufferUtils.createByteBuffer(output.len)
+                .put(output.buff, 0, output.len);
+        ((Buffer) byteBuffer).flip();
+
+        runOnSoundThread(() -> {
+            clearAlError();
+            IntBuffer intBuffer = BufferUtils.createIntBuffer(1);
+            AL10.alGenBuffers(intBuffer);
+            int buffer = intBuffer.get(0);
+            requireAlBuffer(buffer, "create");
+
+            AL10.alBufferData(
+                    buffer,
+                    channels == 1 ? AL10.AL_FORMAT_MONO16 : AL10.AL_FORMAT_STEREO16,
+                    byteBuffer,
+                    frequency);
+            requireAlSuccess("fill buffer");
+
+            AL10.alSourceQueueBuffers(index, buffer);
+            requireAlSuccess("queue buffer");
+
+            if (AL10.alGetSourcei(index, AL10.AL_SOURCE_STATE) != AL10.AL_PLAYING) {
+                AL10.alSourcePlay(index);
+                requireAlSuccess("start source");
+            }
+        });
+    }
+
+    private PlaybackState updatePlaybackState(float volume) {
+        return onSoundThread(() -> {
+            float currentVolume = AL10.alGetSourcef(index, AL10.AL_GAIN);
+            if (currentVolume != volume) {
+                AL10.alSourcef(index, AL10.AL_GAIN, volume);
+            }
+
+            int processed = AL10.alGetSourcei(index, AL10.AL_BUFFERS_PROCESSED);
+            for (int i = 0; i < processed; i++) {
+                int buffer = AL10.alSourceUnqueueBuffers(index);
+                if (buffer != 0) {
+                    AL10.alDeleteBuffers(buffer);
+                }
+            }
+
+            return new PlaybackState(
+                    AL10.alGetSourcei(index, AL10.AL_BUFFERS_QUEUED),
+                    AL10.alGetSourcei(index, AL10.AL_SOURCE_STATE));
+        });
+    }
+
+    private boolean sourcePlaying() {
+        return onSoundThread(() ->
+                AL10.alGetSourcei(index, AL10.AL_SOURCE_STATE) == AL10.AL_PLAYING);
+    }
+
+    private void stopAndClearSource() {
+        runOnSoundThread(() -> {
             AL10.alSourceStop(index);
             AL10.alSourcei(index, AL10.AL_BUFFER, AL10.AL_NONE);
-
-            int queued;
-            do {
-                queued = AL10.alGetSourcei(index, AL10.AL_BUFFERS_QUEUED);
-                if (queued > 0) {
-                    int buffer = AL10.alSourceUnqueueBuffers(index);
-                    if (buffer != 0) {
-                        AL10.alDeleteBuffers(buffer);
-                    }
+            int queued = AL10.alGetSourcei(index, AL10.AL_BUFFERS_QUEUED);
+            while (queued > 0) {
+                int buffer = AL10.alSourceUnqueueBuffers(index);
+                if (buffer != 0) {
+                    AL10.alDeleteBuffers(buffer);
                 }
-            } while (queued > 0);
+                queued--;
+            }
+        });
+    }
 
-            AL10.alSourcef(index, AL10.AL_GAIN, AllMusicCore.bridge.getVolume());
-            AL10.alSourcef(index, AL10.AL_PITCH, 1.0f);
+    private static void clearAlError() {
+        while (AL10.alGetError() != AL10.AL_NO_ERROR) {
+            // alGetError clears one pending error at a time.
+        }
+    }
+
+    private static void requireAlBuffer(int buffer, String operation) {
+        int error = AL10.alGetError();
+        if (buffer == 0 || error != AL10.AL_NO_ERROR) {
+            throw new IllegalStateException("OpenAL failed to " + operation
+                    + " (buffer=" + buffer + ", error=0x"
+                    + Integer.toHexString(error) + ")");
+        }
+    }
+
+    private static void requireAlSuccess(String operation) {
+        int error = AL10.alGetError();
+        if (error != AL10.AL_NO_ERROR) {
+            throw new IllegalStateException("OpenAL failed to " + operation
+                    + " (error=0x" + Integer.toHexString(error) + ")");
+        }
+    }
+
+    private static final class PlaybackState {
+        private final int queued;
+        private final int state;
+
+        private PlaybackState(int queued, int state) {
+            this.queued = queued;
+            this.state = state;
         }
     }
 
@@ -273,7 +394,7 @@ public class AllMusicPlayer extends InputStream implements SeekableInput {
                 }
 
                 if (index == -1) {
-                    index = AL10.alGenSources();
+                    index = onSoundThread(AL10::alGenSources);
                     if (index == 0 && source != null) {
                         index = source.get(0);
                         if (index == 0) {
@@ -281,6 +402,10 @@ public class AllMusicPlayer extends InputStream implements SeekableInput {
                             return;
                         }
                     }
+                }
+
+                if (index == 0) {
+                    throw new IllegalStateException("OpenAL returned source 0");
                 }
 
                 resetSource();
@@ -330,6 +455,7 @@ public class AllMusicPlayer extends InputStream implements SeekableInput {
                 }
                 reload = false;
                 int chatCount = 0;
+                boolean decoderEnded = false;
 
                 while (true) {
                     if (!isRun) {
@@ -338,51 +464,30 @@ public class AllMusicPlayer extends InputStream implements SeekableInput {
                     try {
                         if (isClose) break;
 
-                        while (AL10.alGetSourcei(index, AL10.AL_BUFFERS_QUEUED) < AllMusicCore.config.queueSize) {
+                        while (!decoderEnded && queuedBuffers() < AllMusicCore.config.queueSize) {
                             if (!isRun) {
                                 return;
                             }
                             if (isClose) break;
                             BuffPack output = decoder.decodeFrame();
-                            if (output == null) break;
-                            ByteBuffer byteBuffer = BufferUtils.createByteBuffer(output.len)
-                                    .put(output.buff, 0, output.len);
-                            ((Buffer) byteBuffer).flip();
-
-                            IntBuffer intBuffer = BufferUtils.createIntBuffer(1);
-                            AL10.alGenBuffers(intBuffer);
-                            int buffer = intBuffer.get(0);
-
-                            if (buffer == 0) continue;
-
-                            AL10.alBufferData(
-                                    buffer,
-                                    channels == 1 ? AL10.AL_FORMAT_MONO16 : AL10.AL_FORMAT_STEREO16,
-                                    byteBuffer,
-                                    frequency);
-
-                            AL10.alSourceQueueBuffers(index, buffer);
-
-                            if (AL10.alGetSourcei(index, AL10.AL_SOURCE_STATE) != AL10.AL_PLAYING) {
-                                AL10.alSourcePlay(index);
+                            if (output == null) {
+                                decoderEnded = true;
+                                break;
+                            }
+                            if (output.len > 0) {
+                                queueBuffer(output, channels, frequency);
                             }
                         }
 
-                        float temp = AllMusicCore.bridge.getVolume();
-                        float now = AL10.alGetSourcef(index, AL10.AL_GAIN);
+                        float volume = AllMusicCore.bridge.getVolume();
                         if (isChat) {
-                            temp *= 0.2F;
-                        }
-                        if (now != temp) {
-                            AL10.alSourcef(index, AL10.AL_GAIN, temp);
+                            volume *= 0.2F;
                         }
 
-                        int processed = AL10.alGetSourcei(index, AL10.AL_BUFFERS_PROCESSED);
-                        for (int i = 0; i < processed; i++) {
-                            int buffer = AL10.alSourceUnqueueBuffers(index);
-                            if (buffer != 0) {
-                                AL10.alDeleteBuffers(buffer);
-                            }
+                        PlaybackState playbackState = updatePlaybackState(volume);
+                        if (decoderEnded && playbackState.queued == 0
+                                && playbackState.state != AL10.AL_PLAYING) {
+                            break;
                         }
 
                         Thread.sleep(5);
@@ -406,7 +511,7 @@ public class AllMusicPlayer extends InputStream implements SeekableInput {
                 decodeClose();
                 currentUrl = null;
 
-                while (!isClose && AL10.alGetSourcei(index, AL10.AL_SOURCE_STATE) == AL10.AL_PLAYING) {
+                while (!isClose && sourcePlaying()) {
                     Thread.sleep(50);
                 }
 
@@ -425,16 +530,7 @@ public class AllMusicPlayer extends InputStream implements SeekableInput {
                     }
                     isPlay = false;
 
-                    AL10.alSourceStop(index);
-                    AL10.alSourcei(index, AL10.AL_BUFFER, AL10.AL_NONE);
-                    int queued = AL10.alGetSourcei(index, AL10.AL_BUFFERS_QUEUED);
-                    while (queued > 0) {
-                        int buffer = AL10.alSourceUnqueueBuffers(index);
-                        if (buffer != 0) {
-                            AL10.alDeleteBuffers(buffer);
-                        }
-                        queued--;
-                    }
+                    stopAndClearSource();
                 } else {
                     nowTask = null;
                     tasks.push(task);

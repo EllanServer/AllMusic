@@ -6,6 +6,8 @@ import com.coloryr.allmusic.client.core.render.PictureFrameBuffer;
 import com.coloryr.allmusic.client.core.render.ModernHudRender;
 import com.coloryr.allmusic.client.core.render.TextFrameBuffer;
 import com.coloryr.allmusic.client.core.render.TextureRender;
+import com.coloryr.allmusic.client.mixins.SoundEngineAccessor;
+import com.coloryr.allmusic.client.mixins.SoundManagerAccessor;
 import com.coloryr.allmusic.comm.MusicCodec;
 import com.mojang.blaze3d.textures.GpuTexture;
 import com.mojang.blaze3d.textures.GpuTextureView;
@@ -27,6 +29,8 @@ import org.apache.logging.log4j.Logger;
 import java.io.FileNotFoundException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.CompletableFuture;
+import java.util.function.Supplier;
 
 public class AllMusicClient implements ClientModInitializer, AllMusicBridge {
     public static final String MODID = "allmusic_client";
@@ -67,6 +71,14 @@ public class AllMusicClient implements ClientModInitializer, AllMusicBridge {
 
     public float getVolume() {
         return Minecraft.getInstance().options.getSoundSourceVolume(SoundSource.RECORDS);
+    }
+
+    @Override
+    public <T> T callOnSoundThread(Supplier<T> action) {
+        var soundManager = Minecraft.getInstance().getSoundManager();
+        var soundEngine = ((SoundManagerAccessor) soundManager).allmusic$getSoundEngine();
+        var executor = ((SoundEngineAccessor) soundEngine).allmusic$getExecutor();
+        return CompletableFuture.supplyAsync(action, executor).join();
     }
 
     @Override

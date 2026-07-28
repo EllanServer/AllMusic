@@ -6,6 +6,7 @@ import com.coloryr.allmusic.client.core.render.TextureRender;
 import com.coloryr.allmusic.client.core.render.ModernHudRender;
 
 import java.io.InputStream;
+import java.util.function.Supplier;
 
 /**
  * AllMusic 核心桥
@@ -53,6 +54,15 @@ public interface AllMusicBridge {
      * @return 音量
      */
     float getVolume();
+
+    /**
+     * Runs an OpenAL operation on the platform sound thread. Older Minecraft
+     * versions keep their existing direct-call behavior; modern versions can
+     * override this to use the sound engine executor that owns the AL context.
+     */
+    default <T> T callOnSoundThread(Supplier<T> action) {
+        return action.get();
+    }
 
     /**
      * 停止播放其他音频
