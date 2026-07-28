@@ -25,7 +25,7 @@ tasks {
     remapJar {
         inputFile.set(shadowJar.get().archiveFile)
 
-        archiveFileName.set("[fabric-1.21.8]AllMusic_Client-${project.version}.jar")
+        archiveFileName.set("[fabric-1.21.6]AllMusic_Client-${project.version}.jar")
         destinationDirectory.set(file("${parent!!.projectDir}/../build"))
     }
 
