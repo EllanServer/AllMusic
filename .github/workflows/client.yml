@@ -8,6 +8,7 @@
 name: AllMusic Client
 
 on:
+  workflow_dispatch:
   push:
     # Sequence of patterns matched against refs/heads
     branches:
@@ -37,7 +38,7 @@ jobs:
       - name: build
         shell: cmd
         run: |
-          gradlew :client:buildClient
+          gradlew :client:fabric_26_2:build --configure-on-demand --parallel --max-workers=4
       - name: update
         uses: actions/upload-artifact@v4
         with:

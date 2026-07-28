@@ -14,21 +14,24 @@ public class MP4InputStream {
     public static final String UTF8 = "UTF-8";
     public static final String UTF16 = "UTF-16";
     private static final int BYTE_ORDER_MASK = 0xFEFF;
+    private static final long SEEK_THRESHOLD = 64 * 1024;
     private final InputStream in;
     private final RandomAccessFile fin;
+    private final SeekableInput seekable;
     private int peeked;
     private long offset; //only used with InputStream
 
     /**
      * Constructs an <code>MP4InputStream</code> that reads from an
-     * <code>InputStream</code>. It will have no random access, thus seeking
-     * will not be possible.
+     * <code>InputStream</code>. Random access is available when the supplied
+     * stream also implements {@link SeekableInput}.
      *
      * @param in an <code>InputStream</code> to read from
      */
     MP4InputStream(InputStream in) {
         this.in = in;
         fin = null;
+        seekable = in instanceof SeekableInput ? (SeekableInput) in : null;
         peeked = -1;
         offset = 0;
     }
@@ -43,6 +46,7 @@ public class MP4InputStream {
     MP4InputStream(RandomAccessFile fin) {
         this.fin = fin;
         in = null;
+        seekable = null;
         peeked = -1;
     }
 
@@ -281,15 +285,42 @@ public class MP4InputStream {
      *                     stream has been closed, or if some other I/O error occurs.
      */
     public void skipBytes(final long n) throws IOException {
+        if (n <= 0) {
+            return;
+        }
+
+        if (seekable != null && n >= SEEK_THRESHOLD) {
+            if (offset > Long.MAX_VALUE - n) {
+                throw new IOException("MP4 stream offset overflow");
+            }
+            seek(offset + n);
+            return;
+        }
+
         long l = 0;
-        if (peeked >= 0 && n > 0) {
+        if (peeked >= 0) {
             peeked = -1;
             l++;
         }
 
         while (l < n) {
-            if (in != null) l += in.skip((n - l));
-            else if (fin != null) l += fin.skipBytes((int) (n - l));
+            final long skipped;
+            if (in != null) skipped = in.skip(n - l);
+            else if (fin != null) skipped = fin.skipBytes((int) Math.min(Integer.MAX_VALUE, n - l));
+            else throw new EOFException("no input available");
+
+            if (skipped > 0) {
+                l += skipped;
+                continue;
+            }
+
+            // InputStream is allowed to return zero from skip() before EOF.
+            // Fall back to consuming one byte so the loop always progresses.
+            final int value = in != null ? in.read() : fin.read();
+            if (value < 0) {
+                throw new EOFException("unexpected end of MP4 stream while skipping " + n + " bytes");
+            }
+            l++;
         }
 
         offset += l;
@@ -319,19 +350,35 @@ public class MP4InputStream {
      *                     I/O error occurs
      */
     public void seek(long pos) throws IOException {
+        if (pos < 0) throw new IOException("could not seek to a negative offset: " + pos);
         if (fin != null) fin.seek(pos);
+        else if (seekable != null) {
+            seekable.seek(pos);
+            offset = pos;
+            peeked = -1;
+        }
         else throw new IOException("could not seek: no random access");
     }
 
     /**
      * Indicates, if random access is available. That is, if this
-     * <code>MP4InputStream</code> was constructed with a RandomAccessFile. If
-     * this method returns false, seeking is not possible.
+     * <code>MP4InputStream</code> was constructed with a RandomAccessFile or a
+     * {@link SeekableInput}. If this method returns false, seeking is not
+     * possible.
      *
      * @return true if random access is available
      */
     public boolean hasRandomAccess() {
-        return fin != null;
+        return fin != null || seekable != null;
+    }
+
+    /**
+     * Returns the total input length when it is known.
+     */
+    public long getLength() throws IOException {
+        if (fin != null) return fin.length();
+        if (seekable != null) return seekable.length();
+        return -1;
     }
 
     /**
@@ -342,7 +389,8 @@ public class MP4InputStream {
      */
     public boolean hasLeft() throws IOException {
         final boolean b;
-        if (fin != null) b = fin.getFilePointer() < (fin.length() - 1);
+        if (fin != null) b = fin.getFilePointer() < fin.length();
+        else if (seekable != null && seekable.length() >= 0) b = offset < seekable.length();
         else if (peeked >= 0) b = true;
         else {
             final int i = in.read();

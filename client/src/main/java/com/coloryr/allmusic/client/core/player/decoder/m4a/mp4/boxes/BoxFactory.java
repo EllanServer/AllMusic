@@ -338,14 +338,39 @@ public class BoxFactory implements BoxTypes {
 
         long size = in.readBytes(4);
         long type = in.readBytes(4);
-        if (size == 1) size = in.readBytes(8);
-        if (type == EXTENDED_TYPE) in.skipBytes(16);
+        int headerSize = 8;
+        if (size == 1) {
+            size = in.readBytes(8);
+            headerSize += 8;
+        }
+        if (type == EXTENDED_TYPE) {
+            in.skipBytes(16);
+            headerSize += 16;
+        }
+
+        final long inputLength = in.getLength();
+        if (size == 0) {
+            final long end;
+            if (parent != null) end = parent.getOffset() + parent.getSize();
+            else if (inputLength >= 0) end = inputLength;
+            else throw new IOException("box '" + typeToString(type) + "' at offset " + offset
+                    + " extends to EOF but the input length is unknown");
+            size = end - offset;
+        }
+
+        if (size < headerSize || offset > Long.MAX_VALUE - size) {
+            throw new IOException("invalid box '" + typeToString(type) + "' at offset " + offset
+                    + ": size=" + size + ", header=" + headerSize);
+        }
 
         //error protection
         if (parent != null) {
             final long parentLeft = (parent.getOffset() + parent.getSize()) - offset;
             if (size > parentLeft)
                 throw new IOException("error while decoding box '" + typeToString(type) + "' at offset " + offset + ": box too large for parent");
+        } else if (inputLength >= 0 && size > inputLength - offset) {
+            throw new IOException("error while decoding box '" + typeToString(type) + "' at offset " + offset
+                    + ": box size " + size + " exceeds input length " + inputLength);
         }
 
         Logger.getLogger("MP4 Boxes").finest(typeToString(type));
