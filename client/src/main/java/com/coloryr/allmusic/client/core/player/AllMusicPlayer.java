@@ -33,7 +33,8 @@ public class AllMusicPlayer extends InputStream {
     private final Semaphore semaphore = new Semaphore(0);
     private final Semaphore semaphoreReload = new Semaphore(0);
 
-    private PlayTaskObj nowTask;
+    private volatile PlayTaskObj nowTask;
+    private volatile String currentUrl;
     private CloseableHttpResponse response;
     private BufferedInputStream content;
     private boolean isClose = false;
@@ -82,10 +83,11 @@ public class AllMusicPlayer extends InputStream {
     }
 
     public void setTime(int time) {
-        if (nowTask == null) {
+        PlayTaskObj current = nowTask;
+        if (current == null || current.url == null) {
             return;
         }
-        String url = nowTask.url;
+        String url = current.url;
         closePlayer();
         PlayTaskObj task = new PlayTaskObj();
         task.url = url;
@@ -95,8 +97,13 @@ public class AllMusicPlayer extends InputStream {
     }
 
     public void connect() throws IOException {
+        String url = currentUrl;
+        if (url == null || url.isEmpty()) {
+            throw new IOException("The current music URL is empty");
+        }
+
         streamClose();
-        HttpGet request = new HttpGet(nowTask.url);
+        HttpGet request = new HttpGet(url);
         request.setHeader("Range", "bytes=" + local + "-");
         response = AllMusicCore.client.execute(request);
         int statusCode = response.getCode();
@@ -162,12 +169,21 @@ public class AllMusicPlayer extends InputStream {
                 PlayTaskObj task = tasks.pop();
                 if (task == null || task.url == null || task.url.isEmpty()) continue;
                 tasks.clear();
+                nowTask = task;
+                currentUrl = task.url;
+                isClose = false;
                 try {
                     local = 0;
                     connect();
                 } catch (Exception e) {
+                    try {
+                        streamClose();
+                    } catch (Exception closeException) {
+                        e.addSuppressed(closeException);
+                    }
                     e.printStackTrace();
                     AllMusicCore.bridge.sendMessage("获取音乐失败");
+                    clearCurrentTask(task);
                     continue;
                 }
 
@@ -176,6 +192,7 @@ public class AllMusicPlayer extends InputStream {
                     AllMusicCore.bridge.sendMessage("不支持这样的文件播放");
                     streamClose();
                     decodeClose();
+                    clearCurrentTask(task);
                     continue;
                 }
 
@@ -185,13 +202,13 @@ public class AllMusicPlayer extends InputStream {
                 if (channels != 1 && channels != 2) {
                     streamClose();
                     decodeClose();
+                    clearCurrentTask(task);
                     continue;
                 }
                 if (task.time != 0) {
                     decoder.set(task.time);
                 }
                 reload = false;
-                isClose = false;
                 int chatCount = 0;
 
                 while (true) {
@@ -267,6 +284,7 @@ public class AllMusicPlayer extends InputStream {
 
                 streamClose();
                 decodeClose();
+                currentUrl = null;
 
                 while (!isClose && AL10.alGetSourcei(index, AL10.AL_SOURCE_STATE) == AL10.AL_PLAYING) {
                     Thread.sleep(50);
@@ -279,6 +297,7 @@ public class AllMusicPlayer extends InputStream {
                             break;
                         }
                         if (reload) {
+                            nowTask = null;
                             tasks.push(task);
                             semaphore.release();
                             continue;
@@ -297,14 +316,39 @@ public class AllMusicPlayer extends InputStream {
                         queued--;
                     }
                 } else {
+                    nowTask = null;
                     tasks.push(task);
                     index = -1;
                     semaphore.release();
                 }
+                nowTask = null;
             } catch (Exception e) {
                 e.printStackTrace();
+                isPlay = false;
+                nowTask = null;
+                currentUrl = null;
+                try {
+                    streamClose();
+                } catch (Exception closeException) {
+                    e.addSuppressed(closeException);
+                }
+                try {
+                    decodeClose();
+                } catch (Exception closeException) {
+                    e.addSuppressed(closeException);
+                }
             }
         }
+    }
+
+    private void clearCurrentTask(PlayTaskObj task) {
+        if (nowTask == task) {
+            nowTask = null;
+        }
+        if (currentUrl != null && currentUrl.equals(task.url)) {
+            currentUrl = null;
+        }
+        isPlay = false;
     }
 
     private IDecoder createDecoder() throws IOException {
