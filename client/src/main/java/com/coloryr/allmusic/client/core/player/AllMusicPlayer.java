@@ -6,16 +6,20 @@ import com.coloryr.allmusic.client.core.player.decoder.BuffPack;
 import com.coloryr.allmusic.client.core.player.decoder.IDecoder;
 import com.coloryr.allmusic.client.core.player.decoder.flac.FlacDecoder;
 import com.coloryr.allmusic.client.core.player.decoder.m4a.M4ADecoder;
+import com.coloryr.allmusic.client.core.player.decoder.m4a.mp4.SeekableInput;
 import com.coloryr.allmusic.client.core.player.decoder.mp3.Mp3Decoder;
 import com.coloryr.allmusic.client.core.player.decoder.ogg.OggDecoder;
 import org.apache.hc.client5.http.classic.methods.HttpGet;
 import org.apache.hc.client5.http.impl.classic.CloseableHttpResponse;
+import org.apache.hc.core5.http.Header;
 import org.apache.hc.core5.http.HttpEntity;
 import org.apache.hc.core5.io.CloseMode;
 import org.lwjgl.BufferUtils;
 import org.lwjgl.openal.AL10;
 
 import java.io.BufferedInputStream;
+import java.io.ByteArrayInputStream;
+import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.Buffer;
@@ -26,8 +30,15 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
-public class AllMusicPlayer extends InputStream {
+public class AllMusicPlayer extends InputStream implements SeekableInput {
+
+    private static final int MAX_READ_RETRIES = 3;
+    private static final Pattern CONTENT_RANGE = Pattern.compile(
+            "^bytes\\s+(?:(\\d+)-(\\d+)|\\*)/(\\d+|\\*)$",
+            Pattern.CASE_INSENSITIVE);
 
     private final Stack<PlayTaskObj> tasks = new Stack<>();
     private final Semaphore semaphore = new Semaphore(0);
@@ -45,6 +56,7 @@ public class AllMusicPlayer extends InputStream {
     private int index = -1;
     private IntBuffer source;
     private long local;
+    private volatile long contentLength = -1;
     private boolean isRun;
     private boolean isChat;
     private ScheduledExecutorService scheduler;
@@ -96,25 +108,132 @@ public class AllMusicPlayer extends InputStream {
         semaphore.release();
     }
 
-    public void connect() throws IOException {
+    public synchronized void connect() throws IOException {
         String url = currentUrl;
         if (url == null || url.isEmpty()) {
             throw new IOException("The current music URL is empty");
         }
 
+        final long position = local;
         streamClose();
         HttpGet request = new HttpGet(url);
-        request.setHeader("Range", "bytes=" + local + "-");
-        response = AllMusicCore.client.execute(request);
-        int statusCode = response.getCode();
-        if (statusCode < 200 || statusCode >= 400) {
-            throw new IOException("Unexpected code " + statusCode);
+        request.setHeader("Accept-Encoding", "identity");
+        if (position > 0) {
+            request.setHeader("Range", "bytes=" + position + "-");
         }
-        HttpEntity entity = response.getEntity();
-        if (entity == null) {
-            throw new IOException("Response entity is null");
+
+        CloseableHttpResponse nextResponse = AllMusicCore.client.execute(request);
+        boolean keepResponse = false;
+        try {
+            int statusCode = nextResponse.getCode();
+            RangeInfo range = parseContentRange(nextResponse.getFirstHeader("Content-Range"));
+
+            if (statusCode == 416) {
+                if (range != null && range.length >= 0) {
+                    contentLength = range.length;
+                }
+                if (contentLength >= 0 && position == contentLength) {
+                    content = emptyContent();
+                    return;
+                }
+                throw new EOFException("HTTP range starts outside the audio file: " + position
+                        + " (length=" + contentLength + ")");
+            }
+            if (statusCode != 200 && statusCode != 206) {
+                throw new IOException("Unexpected code " + statusCode);
+            }
+
+            HttpEntity entity = nextResponse.getEntity();
+            if (entity == null) {
+                throw new IOException("Response entity is null");
+            }
+
+            if (statusCode == 206) {
+                if (range == null || range.start != position) {
+                    throw new IOException("Invalid Content-Range for requested offset " + position);
+                }
+                if (range.length >= 0) {
+                    contentLength = range.length;
+                }
+            } else {
+                long responseLength = entity.getContentLength();
+                if (responseLength >= 0) {
+                    contentLength = responseLength;
+                }
+                if (contentLength >= 0 && position > contentLength) {
+                    throw new EOFException("Audio offset " + position + " exceeds length " + contentLength);
+                }
+            }
+
+            BufferedInputStream nextContent = new BufferedInputStream(entity.getContent());
+            if (statusCode == 200 && position > 0) {
+                // Some CDNs ignore Range and return the complete object. Keep
+                // the logical and physical positions aligned by consuming the
+                // exact prefix instead of silently restarting at byte zero.
+                discardFully(nextContent, position);
+            }
+
+            response = nextResponse;
+            content = nextContent;
+            keepResponse = true;
+        } finally {
+            if (!keepResponse) {
+                nextResponse.close(CloseMode.IMMEDIATE);
+            }
         }
-        content = new BufferedInputStream(entity.getContent());
+    }
+
+    private static BufferedInputStream emptyContent() {
+        return new BufferedInputStream(new ByteArrayInputStream(new byte[0]));
+    }
+
+    private static void discardFully(InputStream input, long count) throws IOException {
+        long left = count;
+        byte[] buffer = new byte[8192];
+        while (left > 0) {
+            long skipped = input.skip(left);
+            if (skipped > 0) {
+                left -= skipped;
+                continue;
+            }
+
+            int read = input.read(buffer, 0, (int) Math.min(buffer.length, left));
+            if (read < 0) {
+                throw new EOFException("Audio response ended while discarding " + count + " bytes");
+            }
+            left -= read;
+        }
+    }
+
+    private static RangeInfo parseContentRange(Header header) {
+        if (header == null || header.getValue() == null) {
+            return null;
+        }
+        Matcher matcher = CONTENT_RANGE.matcher(header.getValue().trim());
+        if (!matcher.matches()) {
+            return null;
+        }
+        try {
+            long start = matcher.group(1) == null ? -1 : Long.parseLong(matcher.group(1));
+            long end = matcher.group(2) == null ? -1 : Long.parseLong(matcher.group(2));
+            long length = "*".equals(matcher.group(3)) ? -1 : Long.parseLong(matcher.group(3));
+            if ((start >= 0 && end < start) || (length >= 0 && end >= length)) {
+                return null;
+            }
+            return new RangeInfo(start, length);
+        } catch (NumberFormatException ignored) {
+            return null;
+        }
+    }
+
+    private static final class RangeInfo {
+        private final long start;
+        private final long length;
+
+        private RangeInfo(long start, long length) {
+            this.start = start;
+            this.length = length;
+        }
     }
 
     private void resetSource() {
@@ -174,6 +293,7 @@ public class AllMusicPlayer extends InputStream {
                 isClose = false;
                 try {
                     local = 0;
+                    contentLength = -1;
                     connect();
                 } catch (Exception e) {
                     try {
@@ -431,52 +551,73 @@ public class AllMusicPlayer extends InputStream {
     }
 
     @Override
-    public int read() throws IOException {
-        int value = content.read();
-        if (value >= 0) {
-            local++;
+    public synchronized int read() throws IOException {
+        for (int retries = 0; ; retries++) {
+            try {
+                int value = content.read();
+                if (value >= 0) {
+                    local++;
+                }
+                return value;
+            } catch (IOException e) {
+                if (retries >= MAX_READ_RETRIES) {
+                    throw e;
+                }
+                reconnectAfterReadFailure(e);
+            }
         }
-        return value;
     }
 
     @Override
     public int read(byte[] buf) throws IOException {
-        int length = content.read(buf);
-        if (length > 0) {
-            local += length;
-        }
-        return length;
+        return read(buf, 0, buf.length);
     }
 
     @Override
-    public long skip(long n) throws IOException {
+    public synchronized long skip(long n) throws IOException {
         if (n <= 0) {
             return 0;
         }
 
-        // InputStream.skip() is a forward read, not a random seek. Reopening
-        // the HTTP response with Range here can request bytes=<length>- when
-        // the MP4 parser skips exactly to EOF, which correctly receives 416.
-        // Consume the current response instead; setLocal() remains the random
-        // access path used for actual playback seeking.
-        long skipped = content.skip(n);
-        if (skipped > 0) {
-            local += skipped;
+        // Consume short forward skips through the retrying read path so a
+        // connection failure cannot advance the entity while leaving local
+        // behind. MP4InputStream uses seek() for large structural jumps.
+        byte[] buffer = new byte[(int) Math.min(8192, n)];
+        long total = 0;
+        while (total < n) {
+            int read = read(buffer, 0, (int) Math.min(buffer.length, n - total));
+            if (read < 0) {
+                break;
+            }
+            total += read;
         }
-        return skipped;
+        return total;
     }
 
     @Override
     public synchronized int read(byte[] buf, int off, int len) throws IOException {
-        try {
-            int length = content.read(buf, off, len);
-            if (length > 0) {
-                local += length;
+        for (int retries = 0; ; retries++) {
+            try {
+                int length = content.read(buf, off, len);
+                if (length > 0) {
+                    local += length;
+                }
+                return length;
+            } catch (IOException e) {
+                if (retries >= MAX_READ_RETRIES) {
+                    throw e;
+                }
+                reconnectAfterReadFailure(e);
             }
-            return length;
-        } catch (IOException e) {
+        }
+    }
+
+    private void reconnectAfterReadFailure(IOException readFailure) throws IOException {
+        try {
             connect();
-            return this.read(buf, off, len);
+        } catch (IOException reconnectFailure) {
+            reconnectFailure.addSuppressed(readFailure);
+            throw reconnectFailure;
         }
     }
 
@@ -490,10 +631,31 @@ public class AllMusicPlayer extends InputStream {
         streamClose();
     }
 
-    public void setLocal(long local) throws IOException {
+    @Override
+    public synchronized void seek(long position) throws IOException {
+        if (position < 0) {
+            throw new IOException("Audio offset cannot be negative: " + position);
+        }
+        if (contentLength >= 0 && position > contentLength) {
+            throw new EOFException("Audio offset " + position + " exceeds length " + contentLength);
+        }
+
         streamClose();
-        this.local = local;
+        local = position;
+        if (contentLength >= 0 && position == contentLength) {
+            content = emptyContent();
+            return;
+        }
         connect();
+    }
+
+    @Override
+    public long length() {
+        return contentLength;
+    }
+
+    public void setLocal(long local) throws IOException {
+        seek(local);
     }
 
     public void setReload() {
