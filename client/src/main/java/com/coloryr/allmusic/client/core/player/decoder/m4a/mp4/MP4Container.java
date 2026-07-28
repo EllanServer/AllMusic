@@ -87,7 +87,6 @@ public class MP4Container {
         //read all boxes
         Box box = null;
         long type;
-        boolean moovFound = false;
         while (in.hasLeft()) {
             box = BoxFactory.parseBox(null, in);
             if (boxes.isEmpty() && box.getType() != BoxTypes.FILE_TYPE_BOX)
@@ -98,13 +97,17 @@ public class MP4Container {
             if (type == BoxTypes.FILE_TYPE_BOX) {
                 if (ftyp == null) ftyp = (FileTypeBox) box;
             } else if (type == BoxTypes.MOVIE_BOX) {
-                if (movie == null) moov = box;
-                moovFound = true;
+                if (moov == null) moov = box;
+                // The movie box contains every sample offset needed for
+                // playback. Continuing to scan a network stream can consume
+                // the following mdat header and interpret the first raw AAC
+                // sample as another top-level box (QQ Music C400 files expose
+                // this layout). Track will seek to the sample table offsets.
+                break;
             } else if (type == BoxTypes.PROGRESSIVE_DOWNLOAD_INFORMATION_BOX) {
                 if (pdin == null) pdin = (ProgressiveDownloadInformationBox) box;
             } else if (type == BoxTypes.MEDIA_DATA_BOX) {
-                if (moovFound) break;
-                else if (!in.hasRandomAccess()) throw new MP4Exception("movie box at end of file, need random access");
+                if (!in.hasRandomAccess()) throw new MP4Exception("movie box at end of file, need random access");
             }
         }
     }
