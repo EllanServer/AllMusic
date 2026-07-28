@@ -288,8 +288,23 @@ public class MP4InputStream {
         }
 
         while (l < n) {
-            if (in != null) l += in.skip((n - l));
-            else if (fin != null) l += fin.skipBytes((int) (n - l));
+            final long skipped;
+            if (in != null) skipped = in.skip(n - l);
+            else if (fin != null) skipped = fin.skipBytes((int) Math.min(Integer.MAX_VALUE, n - l));
+            else throw new EOFException("no input available");
+
+            if (skipped > 0) {
+                l += skipped;
+                continue;
+            }
+
+            // InputStream is allowed to return zero from skip() before EOF.
+            // Fall back to consuming one byte so the loop always progresses.
+            final int value = in != null ? in.read() : fin.read();
+            if (value < 0) {
+                throw new EOFException("unexpected end of MP4 stream while skipping " + n + " bytes");
+            }
+            l++;
         }
 
         offset += l;

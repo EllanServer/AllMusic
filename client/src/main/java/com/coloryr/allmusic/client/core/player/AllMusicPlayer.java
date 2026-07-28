@@ -450,15 +450,20 @@ public class AllMusicPlayer extends InputStream {
 
     @Override
     public long skip(long n) throws IOException {
-        if (n <= 2048) {
-            long temp = content.skip(n);
-            local += temp;
-            return temp;
-        } else {
-            local += n;
-            connect();
+        if (n <= 0) {
+            return 0;
         }
-        return n;
+
+        // InputStream.skip() is a forward read, not a random seek. Reopening
+        // the HTTP response with Range here can request bytes=<length>- when
+        // the MP4 parser skips exactly to EOF, which correctly receives 416.
+        // Consume the current response instead; setLocal() remains the random
+        // access path used for actual playback seeking.
+        long skipped = content.skip(n);
+        if (skipped > 0) {
+            local += skipped;
+        }
+        return skipped;
     }
 
     @Override
