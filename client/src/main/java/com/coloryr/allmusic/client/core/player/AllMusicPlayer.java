@@ -323,17 +323,22 @@ public class AllMusicPlayer extends InputStream {
             throw new IOException("The audio response is too short");
         }
 
-        return switch (AudioFormatDetector.detect(head, read)) {
-            case MP3 -> new Mp3Decoder(this);
-            case M4A -> new M4ADecoder(this);
-            case OGG -> new OggDecoder(this);
-            case FLAC -> new FlacDecoder(this);
-            case UNKNOWN -> {
+        AudioFormatDetector.Format format = AudioFormatDetector.detect(head, read);
+        switch (format) {
+            case MP3:
+                return new Mp3Decoder(this);
+            case M4A:
+                return new M4ADecoder(this);
+            case OGG:
+                return new OggDecoder(this);
+            case FLAC:
+                return new FlacDecoder(this);
+            case UNKNOWN:
+            default:
                 System.err.println("[AllMusic Client] Unsupported audio header: "
                         + AudioFormatDetector.hexPrefix(head, read));
-                yield null;
-            }
-        };
+                return null;
+        }
     }
 
     public void tick() {
