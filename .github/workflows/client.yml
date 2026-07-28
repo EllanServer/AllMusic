@@ -38,7 +38,7 @@ jobs:
       - name: build
         shell: cmd
         run: |
-          gradlew :client:fabric_26_2:build --parallel --max-workers=4
+          gradlew :client:fabric_26_2:build --configure-on-demand --parallel --max-workers=4
       - name: update
         uses: actions/upload-artifact@v4
         with:
