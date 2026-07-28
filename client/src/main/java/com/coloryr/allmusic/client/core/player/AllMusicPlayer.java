@@ -4,6 +4,7 @@ import com.coloryr.allmusic.client.core.AllMusicCore;
 import com.coloryr.allmusic.client.core.objs.PlayTaskObj;
 import com.coloryr.allmusic.client.core.player.decoder.BuffPack;
 import com.coloryr.allmusic.client.core.player.decoder.IDecoder;
+import com.coloryr.allmusic.client.core.player.decoder.flac.FlacDecoder;
 import com.coloryr.allmusic.client.core.player.decoder.m4a.M4ADecoder;
 import com.coloryr.allmusic.client.core.player.decoder.mp3.Mp3Decoder;
 import com.coloryr.allmusic.client.core.player.decoder.ogg.OggDecoder;
@@ -170,30 +171,22 @@ public class AllMusicPlayer extends InputStream {
                     continue;
                 }
 
-                byte[] head = new byte[4];
-                content.mark(4);
-                content.read(head);
-                content.reset();
-
-                if (head[0] == 0 && head[1] == 0 && head[2] == 0 && head[3] == 0x1c) {
-                    decoder = new M4ADecoder(this);
-                } else if (head[0] == 'I' && head[1] == 'D' && head[2] == '3') {
-                    decoder = new Mp3Decoder(this);
-                } else if (head[0] == (byte) 0xFF && head[1] == (byte) 0xFB) {
-                    decoder = new Mp3Decoder(this);
-                } else {
-                    decoder = new OggDecoder(this);
-                }
-
-                if (!decoder.set()) {
+                decoder = createDecoder();
+                if (decoder == null || !decoder.set()) {
                     AllMusicCore.bridge.sendMessage("不支持这样的文件播放");
+                    streamClose();
+                    decodeClose();
                     continue;
                 }
 
                 isPlay = true;
                 int frequency = decoder.getOutputFrequency();
                 int channels = decoder.getOutputChannels();
-                if (channels != 1 && channels != 2) continue;
+                if (channels != 1 && channels != 2) {
+                    streamClose();
+                    decodeClose();
+                    continue;
+                }
                 if (task.time != 0) {
                     decoder.set(task.time);
                 }
@@ -314,6 +307,35 @@ public class AllMusicPlayer extends InputStream {
         }
     }
 
+    private IDecoder createDecoder() throws IOException {
+        byte[] head = new byte[12];
+        content.mark(head.length);
+        int read = 0;
+        while (read < head.length) {
+            int count = content.read(head, read, head.length - read);
+            if (count < 0) {
+                break;
+            }
+            read += count;
+        }
+        content.reset();
+        if (read < 4) {
+            throw new IOException("The audio response is too short");
+        }
+
+        return switch (AudioFormatDetector.detect(head, read)) {
+            case MP3 -> new Mp3Decoder(this);
+            case M4A -> new M4ADecoder(this);
+            case OGG -> new OggDecoder(this);
+            case FLAC -> new FlacDecoder(this);
+            case UNKNOWN -> {
+                System.err.println("[AllMusic Client] Unsupported audio header: "
+                        + AudioFormatDetector.hexPrefix(head, read));
+                yield null;
+            }
+        };
+    }
+
     public void tick() {
         if (wait) {
             wait = false;
@@ -336,13 +358,19 @@ public class AllMusicPlayer extends InputStream {
     }
 
     private void streamClose() throws IOException {
-        if (response != null) {
-            response.close(CloseMode.IMMEDIATE);
-            response = null;
-        }
-        if (content != null) {
-            content.close();
-            content = null;
+        CloseableHttpResponse oldResponse = response;
+        BufferedInputStream oldContent = content;
+        response = null;
+        content = null;
+
+        if (oldResponse != null) {
+            // The response owns the entity stream. Closing content again after
+            // an immediate response close makes HttpClient try to drain an
+            // already-aborted Content-Length stream and report a false
+            // "premature end" error.
+            oldResponse.close(CloseMode.IMMEDIATE);
+        } else if (oldContent != null) {
+            oldContent.close();
         }
     }
 
@@ -355,15 +383,20 @@ public class AllMusicPlayer extends InputStream {
 
     @Override
     public int read() throws IOException {
-        local++;
-        return content.read();
+        int value = content.read();
+        if (value >= 0) {
+            local++;
+        }
+        return value;
     }
 
     @Override
     public int read(byte[] buf) throws IOException {
-        int temp = content.read(buf);
-        local += temp;
-        return temp;
+        int length = content.read(buf);
+        if (length > 0) {
+            local += length;
+        }
+        return length;
     }
 
     @Override
@@ -382,9 +415,11 @@ public class AllMusicPlayer extends InputStream {
     @Override
     public synchronized int read(byte[] buf, int off, int len) throws IOException {
         try {
-            int temp = content.read(buf, off, len);
-            local += temp;
-            return temp;
+            int length = content.read(buf, off, len);
+            if (length > 0) {
+                local += length;
+            }
+            return length;
         } catch (IOException e) {
             connect();
             return this.read(buf, off, len);
