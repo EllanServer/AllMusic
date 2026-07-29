@@ -30,12 +30,20 @@ import java.io.FileNotFoundException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Supplier;
 
 public class AllMusicClient implements ClientModInitializer, AllMusicBridge {
     public static final String MODID = "allmusic_client";
     public static final Logger LOGGER = LogManager.getLogger("AllMusic Client");
     public static GuiGraphicsExtractor context;
+    private static final ReentrantReadWriteLock SOUND_RELOAD_LOCK =
+            new ReentrantReadWriteLock(true);
+    private static final AtomicLong SOUND_GENERATION = new AtomicLong();
+    private static volatile CompletableFuture<Void> soundReady =
+            CompletableFuture.completedFuture(null);
 
     public static void update(GuiGraphicsExtractor draw) {
         context = draw;
@@ -75,10 +83,44 @@ public class AllMusicClient implements ClientModInitializer, AllMusicBridge {
 
     @Override
     public <T> T callOnSoundThread(Supplier<T> action) {
-        var soundManager = Minecraft.getInstance().getSoundManager();
-        var soundEngine = ((SoundManagerAccessor) soundManager).allmusic$getSoundEngine();
-        var executor = ((SoundEngineAccessor) soundEngine).allmusic$getExecutor();
-        return CompletableFuture.supplyAsync(action, executor).join();
+        Lock readLock = SOUND_RELOAD_LOCK.readLock();
+        while (true) {
+            CompletableFuture<Void> ready = soundReady;
+            ready.join();
+            readLock.lock();
+            try {
+                if (ready != soundReady) {
+                    continue;
+                }
+                var soundManager = Minecraft.getInstance().getSoundManager();
+                var soundEngine = ((SoundManagerAccessor) soundManager).allmusic$getSoundEngine();
+                var executor = ((SoundEngineAccessor) soundEngine).allmusic$getExecutor();
+                return CompletableFuture.supplyAsync(action, executor).join();
+            } finally {
+                readLock.unlock();
+            }
+        }
+    }
+
+    @Override
+    public long getSoundGeneration() {
+        return SOUND_GENERATION.get();
+    }
+
+    public static void beginSoundReload() {
+        CompletableFuture<Void> nextReady = new CompletableFuture<>();
+        soundReady = nextReady;
+        AllMusicCore.reload();
+        SOUND_RELOAD_LOCK.writeLock().lock();
+        long generation = SOUND_GENERATION.incrementAndGet();
+        LOGGER.info("Suspended AllMusic for sound engine reload {}", generation);
+    }
+
+    public static void finishSoundReload() {
+        CompletableFuture<Void> ready = soundReady;
+        SOUND_RELOAD_LOCK.writeLock().unlock();
+        ready.complete(null);
+        LOGGER.info("Sound engine reload complete; AllMusic may resume");
     }
 
     @Override

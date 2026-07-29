@@ -65,6 +65,15 @@ public interface AllMusicBridge {
     }
 
     /**
+     * Identifies the currently active OpenAL context. Platforms that recreate
+     * their sound engine during a resource reload increment this value so the
+     * player never reuses source names from the old context.
+     */
+    default long getSoundGeneration() {
+        return 0;
+    }
+
+    /**
      * 停止播放其他音频
      */
     void stopPlayMusic();

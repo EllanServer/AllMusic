@@ -49,16 +49,17 @@ public class AllMusicPlayer extends InputStream implements SeekableInput {
     private volatile String currentUrl;
     private CloseableHttpResponse response;
     private BufferedInputStream content;
-    private boolean isClose = false;
-    private boolean reload = false;
+    private volatile boolean isClose = false;
+    private volatile boolean reload = false;
     private IDecoder decoder;
     private volatile boolean isPlay = false;
     private boolean wait = false;
     private int index = -1;
+    private long sourceGeneration = Long.MIN_VALUE;
     private IntBuffer source;
     private long local;
     private volatile long contentLength = -1;
-    private boolean isRun;
+    private volatile boolean isRun;
     private volatile boolean isChat;
     private ScheduledExecutorService scheduler;
 
@@ -237,27 +238,74 @@ public class AllMusicPlayer extends InputStream implements SeekableInput {
         }
     }
 
-    private void resetSource() {
-        if (index != -1) {
-            runOnSoundThread(() -> {
-                AL10.alSourceStop(index);
-                AL10.alSourcei(index, AL10.AL_BUFFER, AL10.AL_NONE);
+    private boolean isCurrentSource() {
+        return index > 0 && sourceGeneration == AllMusicCore.bridge.getSoundGeneration();
+    }
 
-                int queued;
-                do {
-                    queued = AL10.alGetSourcei(index, AL10.AL_BUFFERS_QUEUED);
-                    if (queued > 0) {
-                        int buffer = AL10.alSourceUnqueueBuffers(index);
-                        if (buffer != 0) {
-                            AL10.alDeleteBuffers(buffer);
-                        }
-                    }
-                } while (queued > 0);
+    private void prepareSource() {
+        while (true) {
+            if (!isCurrentSource()) {
+                SourceHandle created = onSoundThread(() -> {
+                    long generation = AllMusicCore.bridge.getSoundGeneration();
+                    clearAlError();
+                    int sourceId = AL10.alGenSources();
+                    int error = AL10.alGetError();
+                    return new SourceHandle(sourceId, generation, error);
+                });
 
-                AL10.alSourcef(index, AL10.AL_GAIN, AllMusicCore.bridge.getVolume());
-                AL10.alSourcef(index, AL10.AL_PITCH, 1.0f);
-            });
+                if (created.generation != AllMusicCore.bridge.getSoundGeneration()) {
+                    continue;
+                }
+
+                int sourceId = created.sourceId;
+                boolean usedFallback = false;
+                if (sourceId == 0 && source != null) {
+                    sourceId = source.get(0);
+                    usedFallback = sourceId != 0;
+                }
+                if (sourceId == 0 || (!usedFallback && created.error != AL10.AL_NO_ERROR)) {
+                    throw new IllegalStateException("OpenAL failed to create source"
+                            + " (source=" + sourceId + ", error=0x"
+                            + Integer.toHexString(created.error) + ")");
+                }
+                index = sourceId;
+                sourceGeneration = created.generation;
+            }
+
+            if (resetSource() && isCurrentSource()) {
+                return;
+            }
+            index = -1;
         }
+    }
+
+    private boolean resetSource() {
+        if (index == -1) {
+            return false;
+        }
+        return onSoundThread(() -> {
+            if (!isCurrentSource()) {
+                return false;
+            }
+
+            AL10.alSourceStop(index);
+            AL10.alSourcei(index, AL10.AL_BUFFER, AL10.AL_NONE);
+
+            int queued;
+            do {
+                queued = AL10.alGetSourcei(index, AL10.AL_BUFFERS_QUEUED);
+                if (queued > 0) {
+                    int buffer = AL10.alSourceUnqueueBuffers(index);
+                    if (buffer != 0) {
+                        AL10.alDeleteBuffers(buffer);
+                    }
+                }
+            } while (queued > 0);
+
+            AL10.alSourcef(index, AL10.AL_GAIN, AllMusicCore.bridge.getVolume());
+            AL10.alSourcef(index, AL10.AL_PITCH, 1.0f);
+            return true;
+        });
     }
 
     private <T> T onSoundThread(Supplier<T> action) {
@@ -272,7 +320,12 @@ public class AllMusicPlayer extends InputStream implements SeekableInput {
     }
 
     private int queuedBuffers() {
-        return onSoundThread(() -> AL10.alGetSourcei(index, AL10.AL_BUFFERS_QUEUED));
+        return onSoundThread(() -> {
+            if (isClose || !isCurrentSource()) {
+                return Integer.MAX_VALUE;
+            }
+            return AL10.alGetSourcei(index, AL10.AL_BUFFERS_QUEUED);
+        });
     }
 
     private void queueBuffer(BuffPack output, int channels, int frequency) {
@@ -281,6 +334,9 @@ public class AllMusicPlayer extends InputStream implements SeekableInput {
         ((Buffer) byteBuffer).flip();
 
         runOnSoundThread(() -> {
+            if (isClose || !isCurrentSource()) {
+                return;
+            }
             clearAlError();
             IntBuffer intBuffer = BufferUtils.createIntBuffer(1);
             AL10.alGenBuffers(intBuffer);
@@ -306,6 +362,9 @@ public class AllMusicPlayer extends InputStream implements SeekableInput {
 
     private PlaybackState updatePlaybackState(float volume) {
         return onSoundThread(() -> {
+            if (isClose || !isCurrentSource()) {
+                return new PlaybackState(0, AL10.AL_STOPPED);
+            }
             float currentVolume = AL10.alGetSourcef(index, AL10.AL_GAIN);
             if (currentVolume != volume) {
                 AL10.alSourcef(index, AL10.AL_GAIN, volume);
@@ -326,12 +385,15 @@ public class AllMusicPlayer extends InputStream implements SeekableInput {
     }
 
     private boolean sourcePlaying() {
-        return onSoundThread(() ->
-                AL10.alGetSourcei(index, AL10.AL_SOURCE_STATE) == AL10.AL_PLAYING);
+        return onSoundThread(() -> !isClose && isCurrentSource()
+                && AL10.alGetSourcei(index, AL10.AL_SOURCE_STATE) == AL10.AL_PLAYING);
     }
 
     private void stopAndClearSource() {
         runOnSoundThread(() -> {
+            if (!isCurrentSource()) {
+                return;
+            }
             AL10.alSourceStop(index);
             AL10.alSourcei(index, AL10.AL_BUFFER, AL10.AL_NONE);
             int queued = AL10.alGetSourcei(index, AL10.AL_BUFFERS_QUEUED);
@@ -368,6 +430,18 @@ public class AllMusicPlayer extends InputStream implements SeekableInput {
         }
     }
 
+    private static final class SourceHandle {
+        private final int sourceId;
+        private final long generation;
+        private final int error;
+
+        private SourceHandle(int sourceId, long generation, int error) {
+            this.sourceId = sourceId;
+            this.generation = generation;
+            this.error = error;
+        }
+    }
+
     private static final class PlaybackState {
         private final int queued;
         private final int state;
@@ -393,28 +467,14 @@ public class AllMusicPlayer extends InputStream implements SeekableInput {
                     return;
                 }
 
-                if (index == -1) {
-                    index = onSoundThread(AL10::alGenSources);
-                    if (index == 0 && source != null) {
-                        index = source.get(0);
-                        if (index == 0) {
-                            AllMusicCore.bridge.sendMessage("音频源创建失败");
-                            return;
-                        }
-                    }
-                }
-
-                if (index == 0) {
-                    throw new IllegalStateException("OpenAL returned source 0");
-                }
-
-                resetSource();
+                prepareSource();
 
                 PlayTaskObj task = tasks.pop();
                 if (task == null || task.url == null || task.url.isEmpty()) continue;
                 tasks.clear();
                 nowTask = task;
                 currentUrl = task.url;
+                reload = false;
                 isClose = false;
                 try {
                     local = 0;
@@ -453,7 +513,6 @@ public class AllMusicPlayer extends InputStream implements SeekableInput {
                 if (task.time != 0) {
                     decoder.set(task.time);
                 }
-                reload = false;
                 int chatCount = 0;
                 boolean decoderEnded = false;
 
@@ -462,6 +521,10 @@ public class AllMusicPlayer extends InputStream implements SeekableInput {
                         return;
                     }
                     try {
+                        if (!isCurrentSource()) {
+                            reload = true;
+                            isClose = true;
+                        }
                         if (isClose) break;
 
                         while (!decoderEnded && queuedBuffers() < AllMusicCore.config.queueSize) {
@@ -478,6 +541,12 @@ public class AllMusicPlayer extends InputStream implements SeekableInput {
                                 queueBuffer(output, channels, frequency);
                             }
                         }
+
+                        if (!isCurrentSource()) {
+                            reload = true;
+                            isClose = true;
+                        }
+                        if (isClose) break;
 
                         float volume = AllMusicCore.bridge.getVolume();
                         if (isChat) {
