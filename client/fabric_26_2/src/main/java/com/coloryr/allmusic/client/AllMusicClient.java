@@ -30,20 +30,19 @@ import java.io.FileNotFoundException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.locks.Lock;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Supplier;
 
 public class AllMusicClient implements ClientModInitializer, AllMusicBridge {
     public static final String MODID = "allmusic_client";
     public static final Logger LOGGER = LogManager.getLogger("AllMusic Client");
     public static GuiGraphicsExtractor context;
-    private static final ReentrantReadWriteLock SOUND_RELOAD_LOCK =
-            new ReentrantReadWriteLock(true);
+    private static final long SOUND_TASK_TIMEOUT_SECONDS = 10;
     private static final AtomicLong SOUND_GENERATION = new AtomicLong();
-    private static volatile CompletableFuture<Void> soundReady =
-            CompletableFuture.completedFuture(null);
+    private static volatile SoundEpoch soundEpoch = SoundEpoch.initial();
 
     public static void update(GuiGraphicsExtractor draw) {
         context = draw;
@@ -83,44 +82,87 @@ public class AllMusicClient implements ClientModInitializer, AllMusicBridge {
 
     @Override
     public <T> T callOnSoundThread(Supplier<T> action) {
-        Lock readLock = SOUND_RELOAD_LOCK.readLock();
         while (true) {
-            CompletableFuture<Void> ready = soundReady;
-            ready.join();
-            readLock.lock();
+            SoundEpoch epoch = soundEpoch;
+            epoch.ready.join();
+            if (epoch != soundEpoch) {
+                continue;
+            }
+
+            var soundManager = Minecraft.getInstance().getSoundManager();
+            var soundEngine = ((SoundManagerAccessor) soundManager).allmusic$getSoundEngine();
+            var executor = ((SoundEngineAccessor) soundEngine).allmusic$getExecutor();
+            CompletableFuture<T> result = new CompletableFuture<>();
+            executor.execute(() -> {
+                if (epoch != soundEpoch) {
+                    result.cancel(false);
+                    return;
+                }
+                try {
+                    result.complete(action.get());
+                } catch (Throwable throwable) {
+                    result.completeExceptionally(throwable);
+                }
+            });
+
             try {
-                if (ready != soundReady) {
+                CompletableFuture.anyOf(result, epoch.invalidated)
+                        .orTimeout(SOUND_TASK_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                        .join();
+            } catch (CompletionException exception) {
+                if (epoch != soundEpoch) {
+                    result.cancel(false);
                     continue;
                 }
-                var soundManager = Minecraft.getInstance().getSoundManager();
-                var soundEngine = ((SoundManagerAccessor) soundManager).allmusic$getSoundEngine();
-                var executor = ((SoundEngineAccessor) soundEngine).allmusic$getExecutor();
-                return CompletableFuture.supplyAsync(action, executor).join();
-            } finally {
-                readLock.unlock();
+                if (exception.getCause() instanceof TimeoutException) {
+                    throw new IllegalStateException(
+                            "Timed out waiting for the Minecraft sound executor", exception.getCause());
+                }
+                throw exception;
             }
+
+            if (epoch != soundEpoch) {
+                result.cancel(false);
+                continue;
+            }
+            return result.join();
         }
     }
 
     @Override
     public long getSoundGeneration() {
-        return SOUND_GENERATION.get();
+        return soundEpoch.generation;
     }
 
     public static void beginSoundReload() {
-        CompletableFuture<Void> nextReady = new CompletableFuture<>();
-        soundReady = nextReady;
-        AllMusicCore.reload();
-        SOUND_RELOAD_LOCK.writeLock().lock();
+        SoundEpoch previous = soundEpoch;
         long generation = SOUND_GENERATION.incrementAndGet();
+        soundEpoch = new SoundEpoch(generation, new CompletableFuture<>());
+        // SoundEngine.stopAll() drops queued executor tasks. Wake callers that
+        // might otherwise wait forever for a task discarded during the reload.
+        previous.invalidated.complete(null);
+        AllMusicCore.reload();
         LOGGER.info("Suspended AllMusic for sound engine reload {}", generation);
     }
 
     public static void finishSoundReload() {
-        CompletableFuture<Void> ready = soundReady;
-        SOUND_RELOAD_LOCK.writeLock().unlock();
-        ready.complete(null);
+        soundEpoch.ready.complete(null);
         LOGGER.info("Sound engine reload complete; AllMusic may resume");
+    }
+
+    private static final class SoundEpoch {
+        private final long generation;
+        private final CompletableFuture<Void> ready;
+        private final CompletableFuture<Void> invalidated = new CompletableFuture<>();
+
+        private SoundEpoch(long generation, CompletableFuture<Void> ready) {
+            this.generation = generation;
+            this.ready = ready;
+        }
+
+        private static SoundEpoch initial() {
+            return new SoundEpoch(0, CompletableFuture.completedFuture(null));
+        }
     }
 
     @Override
