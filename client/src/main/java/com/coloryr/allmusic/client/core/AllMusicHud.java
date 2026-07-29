@@ -25,6 +25,9 @@ public class AllMusicHud {
     private static final long AUTO_HIDE_DELAY_MILLIS = 1200L;
     private static final int MODERN_KTV_BASE_COLOR = 0xE8F0F6;
     private static final int MODERN_KTV_PROGRESS_COLOR = 0x61E8F0;
+    private static final long DEFAULT_FALLBACK_KTV_DURATION_MILLIS = 4500L;
+    private static final long MIN_FALLBACK_KTV_DURATION_MILLIS = 1200L;
+    private static final long MAX_FALLBACK_KTV_DURATION_MILLIS = 10000L;
     private static final String PG1 = "textures/hud/pg1.png";
     private static final String PG2 = "textures/hud/pg2.png";
     private static final String PG3 = "textures/hud/pg3.png";
@@ -66,7 +69,7 @@ public class AllMusicHud {
     private final TextureRender progress3;
     private final TextureRender bg1;
     private final TextureRender bg3;
-    public KtvLyricObj ktv = null;
+    public volatile KtvLyricObj ktv = null;
     /**
      * 图片buffer
      */
@@ -82,8 +85,12 @@ public class AllMusicHud {
     private String lyricKtv = "";
     private long allTime, nowTime;
     private HudPosObj save;
-    private float lyricState = 0.0f;
-    private long lyricTime = -1;
+    private volatile float lyricState = 0.0f;
+    private volatile long lyricTime = -1;
+    private volatile long lyricAnchorSongTime = -1;
+    private volatile long lyricAnchorNanos;
+    private long fallbackKtvLastStart = -1;
+    private long fallbackKtvDuration = DEFAULT_FALLBACK_KTV_DURATION_MILLIS;
     private int lyricWidth;
     private int modernKtvWidth;
     private float modernVisibleWidth;
@@ -262,7 +269,10 @@ public class AllMusicHud {
 
     private void lyricTick() {
         if (save == null || ktv == null || lyricTime == -1) return;
-        lyricTime += 10;
+        long anchorSongTime = lyricAnchorSongTime;
+        if (anchorSongTime < 0) return;
+        long elapsedNanos = Math.max(0L, System.nanoTime() - lyricAnchorNanos);
+        lyricTime = anchorSongTime + TimeUnit.NANOSECONDS.toMillis(elapsedNanos);
         kUpdate();
         updateKtvOffset();
     }
@@ -314,6 +324,10 @@ public class AllMusicHud {
         allTime = nowTime = 0;
         ktv = null;
         lyricTime = -1;
+        lyricAnchorSongTime = -1;
+        lyricAnchorNanos = 0;
+        fallbackKtvLastStart = -1;
+        fallbackKtvDuration = DEFAULT_FALLBACK_KTV_DURATION_MILLIS;
         lyricState = 0.0f;
         lyricWidth = 0;
         modernKtvWidth = 0;
@@ -350,35 +364,84 @@ public class AllMusicHud {
     }
 
     public void kUpdate() {
-        if (ktv == null) {
+        KtvLyricObj currentKtv = ktv;
+        if (!isUsableKtv(currentKtv)) {
             lyricState = 0.0f;
             return;
         }
 
-        if (lyricTime <= ktv.start) {
+        if (lyricTime <= currentKtv.start) {
             lyricState = 0.0f;
             return;
         }
 
-        if (lyricTime >= ktv.start + ktv.time) {
+        if (lyricTime >= currentKtv.start + currentKtv.time) {
             lyricState = 1.0f;
             return;
         }
 
         float now = 0;
-        for (int i = 0; i < ktv.items.size(); i++) {
-            KtvLyricObj.KtvItem item = ktv.items.get(i);
-            float itemp = (float) item.key.length() / ktv.charCount;
+        for (KtvLyricObj.KtvItem item : currentKtv.items) {
+            if (item == null || item.key == null || item.key.isEmpty() || item.time <= 0) continue;
+            float itemp = (float) item.key.length() / currentKtv.charCount;
+            if (lyricTime < item.start) {
+                lyricState = clamp01(now);
+                return;
+            }
             if (lyricTime >= item.start && lyricTime < item.start + item.time) {
                 float progressInChar = (float) (lyricTime - item.start) / item.time * itemp;
-                lyricState = now + progressInChar;
+                lyricState = clamp01(now + progressInChar);
                 return;
             }
 
             now += itemp;
         }
 
-        lyricState = 0.0f;
+        // Keep the completed part highlighted while waiting for the next timed
+        // word instead of jumping the whole line back to zero.
+        lyricState = clamp01(now);
+    }
+
+    private static float clamp01(float value) {
+        return Math.max(0.0f, Math.min(1.0f, value));
+    }
+
+    private static boolean isUsableKtv(KtvLyricObj value) {
+        if (value == null || value.items == null || value.items.isEmpty()
+                || value.charCount <= 0 || value.time <= 0) {
+            return false;
+        }
+        for (KtvLyricObj.KtvItem item : value.items) {
+            if (item != null && item.key != null && !item.key.isEmpty() && item.time > 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Ordinary LRC has line timestamps but no per-character timings. Animate the
+     * whole line in that case and learn a reasonable duration from line changes.
+     */
+    private KtvLyricObj makeFallbackKtv(long time) {
+        if (fallbackKtvLastStart >= 0 && time > fallbackKtvLastStart) {
+            long observedDuration = Math.max(MIN_FALLBACK_KTV_DURATION_MILLIS,
+                    Math.min(MAX_FALLBACK_KTV_DURATION_MILLIS, time - fallbackKtvLastStart));
+            fallbackKtvDuration = (fallbackKtvDuration + observedDuration) / 2;
+        }
+        fallbackKtvLastStart = time;
+
+        KtvLyricObj fallback = new KtvLyricObj();
+        fallback.start = time;
+        fallback.time = fallbackKtvDuration;
+        fallback.charCount = 1;
+
+        KtvLyricObj.KtvItem item = new KtvLyricObj.KtvItem();
+        item.start = time;
+        item.time = fallbackKtvDuration;
+        item.key = "x";
+        fallback.items.add(item);
+        return fallback;
     }
 
     /**
@@ -865,7 +928,7 @@ public class AllMusicHud {
         this.ktv = null;
         this.lyric = lyric;
         this.lyricTran = tlyric;
-        this.lyricKtv = ktv;
+        this.lyricKtv = ktv == null || ktv.isEmpty() ? lyric : ktv;
 
         lyricState = 0.0f;
 
@@ -873,9 +936,23 @@ public class AllMusicHud {
     }
 
     public void setKtv(long time, KtvLyricObj pack2) {
-        ktv = pack2;
+        KtvLyricObj nextKtv;
+        if (isUsableKtv(pack2)) {
+            nextKtv = pack2;
+            fallbackKtvLastStart = -1;
+        } else if (lyricKtv != null && !lyricKtv.isEmpty()) {
+            nextKtv = makeFallbackKtv(time);
+        } else {
+            nextKtv = null;
+        }
+
         lyricTime = time;
-        if (pack2 == null) {
+        lyricAnchorSongTime = time;
+        lyricAnchorNanos = System.nanoTime();
+        // Publish the KTV object after its clock anchor is ready.
+        ktv = nextKtv;
+        kUpdate();
+        if (nextKtv == null) {
             lyricRender.clearKtvOffset();
             lyricKtvRender.clearKtvOffset();
             modernKtvBaseRender.clearKtvOffset();
